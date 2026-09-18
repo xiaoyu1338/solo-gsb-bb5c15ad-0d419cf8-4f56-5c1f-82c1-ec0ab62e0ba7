@@ -41,6 +41,17 @@ def _get_stream(conn: sqlite3.Connection, stream_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def is_sealed(conn: sqlite3.Connection, stream_id: str) -> bool:
+    """Return True when ``stream_id`` has a (permanent) seal row.
+
+    Must run inside an open transaction so the caller's write lock guarantees
+    the result stays valid until commit.
+    """
+    return conn.execute(
+        "SELECT 1 FROM seals WHERE stream_id = ?", (stream_id,)
+    ).fetchone() is not None
+
+
 def _get_event(
     conn: sqlite3.Connection, stream_id: str, event_id: str
 ) -> sqlite3.Row | None:
@@ -155,6 +166,14 @@ def submit_event(
                 )
             replayed = True
         else:
+            # Sealing is irreversible: a sealed stream rejects any *new* event.
+            # Completed operations stay replayable because they take the branch
+            # above without writing.
+            if is_sealed(conn, stream_id):
+                raise ConflictError(
+                    "stream_sealed",
+                    f"stream {stream_id!r} is sealed and cannot accept new events",
+                )
             clash = _get_event_by_sequence(conn, stream_id, sequence)
             if clash is not None:
                 # The UNIQUE(stream_id, sequence) index also guards this, but

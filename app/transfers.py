@@ -152,6 +152,18 @@ def create_transfer(
                 status_code=404,
             )
 
+        # A sealed stream can never gain another event; the replay branch
+        # above returned before this point, so transfers completed before the
+        # seal remain idempotently replayable.
+        source_sealed = repo.is_sealed(conn, source_stream_id)
+        target_sealed = repo.is_sealed(conn, target_stream_id)
+        if source_sealed or target_sealed:
+            sealed = source_stream_id if source_sealed else target_stream_id
+            raise TransferError(
+                "stream_sealed",
+                f"stream {sealed!r} is sealed and cannot accept new events",
+            )
+
         # Balance reflects exactly the applied prefix [0, next_sequence); the
         # pending buffered events are not spendable until their gap closes.
         if source["balance"] < amount:

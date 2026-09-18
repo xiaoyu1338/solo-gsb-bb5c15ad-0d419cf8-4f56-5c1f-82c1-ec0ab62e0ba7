@@ -116,6 +116,32 @@ def initialise() -> None:
                     REFERENCES events(stream_id, event_id)
             );
 
+            -- One row per sealed stream: sealing is irreversible, so
+            -- stream_id alone is the primary key. seal_id is the client-
+            -- assigned idempotency key within the stream and
+            -- next_sequence records the sealed version (the applied-prefix
+            -- length at seal time). sha256 covers the canonical newline-
+            -- joined JSON rendering of every event in sequence order.
+            CREATE TABLE IF NOT EXISTS seals (
+                stream_id     TEXT PRIMARY KEY,
+                seal_id       TEXT    NOT NULL,
+                next_sequence INTEGER NOT NULL CHECK (next_sequence >= 0),
+                event_count   INTEGER NOT NULL CHECK (event_count >= 0),
+                sha256        TEXT    NOT NULL,
+                FOREIGN KEY (stream_id) REFERENCES streams(stream_id)
+            );
+
+            -- Defence in depth: a sealed stream may never gain another event.
+            -- Application code rejects such attempts first; this trigger makes
+            -- the invariant hold at the storage layer as well (it fires only on
+            -- INSERT, so idempotent replays that write nothing are unaffected).
+            CREATE TRIGGER IF NOT EXISTS trg_events_sealed_insert
+            BEFORE INSERT ON events
+            WHEN EXISTS (SELECT 1 FROM seals WHERE stream_id = NEW.stream_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'stream is sealed and cannot accept new events');
+            END;
+
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
             -- NULL (no lease) or all set together.

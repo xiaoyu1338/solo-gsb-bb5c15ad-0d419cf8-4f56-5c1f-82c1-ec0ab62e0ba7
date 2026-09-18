@@ -39,6 +39,15 @@
   最新状态，对不同目标返回 `409`；同一事件换一个 `reversal_id` 再次撤销返回
   `409`；并发重试只补偿一次。补偿事件就是普通的已应用事件，可被查询、消费与
   分叉接口正常观察。
+- **不可逆封存（seal）**：`POST /streams/{stream_id}/seal` 以流内幂等键
+  `seal_id` 与乐观版本号 `expected_next_sequence` 封存一个**无暂存事件、版本匹配**
+  的流：在同一个 `BEGIN IMMEDIATE` 事务内按 sequence 升序把每条
+  `[sequence,event_id,delta]` 编码为**保留 Unicode、无空白**的紧凑 UTF-8 JSON，
+  以换行拼接后计算 SHA-256 并写入封存记录。封存不可逆：封存后普通提交、转账（任一侧）
+  与新撤销都会被拒绝（`409 stream_sealed`），但这些操作在封存**之前已完成**的幂等
+  重放仍返回原结果；封存流仍可查询、消费（claim/ack）并作为 fork 源，fork 出来的
+  新流不受影响、可继续追加。相同请求重试返回原封存结果（`200`），参数冲突返回
+  `409`，并发重试只封存一次。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -338,6 +347,73 @@ Content-Type: application/json
 }
 ```
 
+### 8. 不可逆封存流（seal）
+
+```
+POST /streams/{stream_id}/seal
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段                      | 类型   | 约束           | 说明                                     |
+| ------------------------- | ------ | -------------- | ---------------------------------------- |
+| `seal_id`                 | string | 非空，流内唯一 | 客户端分配的幂等键（重试键）             |
+| `expected_next_sequence`  | int    | `>= 0`         | 乐观版本号，必须等于流当前 `next_sequence` |
+
+仅当**流存在、没有暂存（pending）事件且 `expected_next_sequence` 与流当前版本一致**
+时，才在**同一个 `BEGIN IMMEDIATE` 事务**内完成封存：
+
+1. 按 `sequence` 升序读取全部已应用事件（已应用事件恰好占据
+   `[0, next_sequence)`）；
+2. 每条事件编码为一行 `[sequence,event_id,delta]` 的**规范 JSON**：使用
+   `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`——
+   **不转义非 ASCII 字符**（Unicode 原样保留）、**不含任何多余空白**、键（数组）
+   顺序固定，并以 UTF-8 编码；
+3. 各行以 `\n` 拼接（**行之间一个换行，末尾无换行**），对拼接字节计算 SHA-256；
+   空流（0 条事件）的哈希即空输入的 SHA-256
+   （`e3b0c442...b855`）；
+4. 写入 `seals` 封存记录（`seal_id`、封存版本、事件数、SHA-256），统一提交。
+
+封存**不可逆**。封存后：
+
+- 会向该流新增事件的操作一律拒绝：普通事件提交、以该流为源流或目标流的**新**转账、
+  针对该流的**新**撤销，均返回 `409 stream_sealed`，不写入任何数据；
+- 这些操作在封存**之前已完成**的幂等重放（相同 `event_id` / `transfer_id` /
+  `reversal_id`）仍返回**原结果**（`200`），不会重复追加事件；
+- 流仍可 `GET` 查询、消费者 claim/ack 正常消费，并可作为 fork 源整体复制；
+  fork 出来的目标流是独立的新流，**不继承封存状态**，可继续追加事件。
+
+- `201 Created`：首次封存成功；
+- `200 OK`：相同 `seal_id` 与相同 `expected_next_sequence` 的幂等重试，返回原封存
+  记录（相同 SHA-256）；
+- `409 Conflict`：
+  - `version_mismatch`：流当前 `next_sequence` 与 `expected_next_sequence` 不一致
+    （客户端版本过期），失败不会消耗 `seal_id`；
+  - `stream_has_pending_events`：流中仍有因缺号暂存、尚未应用的事件，需先补齐
+    缺号再封存；
+  - `seal_replay_conflict`：流已封存，但重试的 `seal_id` 或
+    `expected_next_sequence` 与原封存不同；
+  - `stream_sealed`：对已封存流发起任何新增事件操作（提交/转账/撤销）；
+- `404 Not Found`：`stream_not_found`——流不存在（封存不会自动建流）；
+- `422 Unprocessable Entity`：请求体字段校验失败。
+
+并发的相同封存请求在写锁上串行：恰好一个请求得到 `201`，其余全部拿到 `200`
+原结果；`seals` 表以 `stream_id` 为主键，保证每流至多一条封存记录。此外数据库层
+的 `BEFORE INSERT` 触发器也会阻止向已封存流直接插入事件（纵深防御）。
+
+```json
+{
+  "status": "ok",
+  "replayed": false,
+  "stream_id": "acct-1",
+  "seal_id": "seal-1",
+  "next_sequence": 3,
+  "event_count": 3,
+  "sha256": "f3d08fa746c6fea7fbc20dcbd239518bec04b1224b5fcb406443ae15d8cd359b"
+}
+```
+
 ## 工作机制示例
 
 ```bash
@@ -589,6 +665,87 @@ curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-b/claim \
 # -> events 中包含 {"event_id":"reversal:rev-1","sequence":4,"delta":-50}
 ```
 
+## 流封存示例（seal）
+
+```bash
+# 准备一个无缺号、无暂存事件的流（balance=130, next_sequence=3）
+curl -s -X POST localhost:8000/streams/acct-9/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e0","sequence":0,"delta":100}'
+curl -s -X POST localhost:8000/streams/acct-9/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e1","sequence":1,"delta":-30}'
+curl -s -X POST localhost:8000/streams/acct-9/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e2","sequence":2,"delta":60}'
+
+# 在版本 3 封存：对 [0,"e0",100]\n[1,"e1",-30]\n[2,"e2",60] 计算 SHA-256
+curl -s -X POST localhost:8000/streams/acct-9/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"seal-1","expected_next_sequence":3}'
+# 201:
+# {"status":"ok","replayed":false,"stream_id":"acct-9","seal_id":"seal-1",
+#  "next_sequence":3,"event_count":3,
+#  "sha256":"<按规范 JSON 行拼接得到的 SHA-256>"}
+
+# 相同请求重试：幂等返回 200 与同一 SHA-256
+curl -s -i -X POST localhost:8000/streams/acct-9/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"seal-1","expected_next_sequence":3}'
+# HTTP/1.1 200 OK
+
+# 换 seal_id 或版本号：409 seal_replay_conflict
+curl -s -i -X POST localhost:8000/streams/acct-9/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"seal-2","expected_next_sequence":3}'
+# HTTP/1.1 409
+
+# 封存后新增普通事件：409 stream_sealed
+curl -s -i -X POST localhost:8000/streams/acct-9/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e3","sequence":3,"delta":1}'
+# HTTP/1.1 409 -> {"detail":{"code":"stream_sealed", ...}}
+
+# 封存前已提交事件的幂等重放：仍返回 200 原结果
+curl -s -i -X POST localhost:8000/streams/acct-9/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"e0","sequence":0,"delta":100}'
+# HTTP/1.1 200 OK -> replayed=true
+
+# 查询、消费、fork 源一切正常
+curl -s localhost:8000/streams/acct-9
+curl -s -X POST localhost:8000/streams/acct-9/consumers/w/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}'
+curl -s -X POST localhost:8000/streams/acct-9/forks \
+  -H 'Content-Type: application/json' \
+  -d '{"fork_id":"f1","target_stream_id":"acct-9-copy","through_sequence":3}'
+# fork 目标是独立的新流，不继承封存，可继续追加
+
+# 版本过期：实际 next_sequence 与 expected_next_sequence 不符 -> 409 version_mismatch
+curl -s -X POST localhost:8000/streams/acct-1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"s0","sequence":0,"delta":1}'
+curl -s -i -X POST localhost:8000/streams/acct-1/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"seal-x","expected_next_sequence":99}'
+# HTTP/1.1 409
+
+# 仍有缺号暂存事件：409 stream_has_pending_events
+curl -s -X POST localhost:8000/streams/acct-g/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"g1","sequence":1,"delta":1}'   # 缺 0，暂存
+curl -s -i -X POST localhost:8000/streams/acct-g/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"seal-g","expected_next_sequence":0}'
+# HTTP/1.1 409
+
+# 流不存在：404（封存不自动建流）
+curl -s -i -X POST localhost:8000/streams/ghost/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"s","expected_next_sequence":0}'
+# HTTP/1.1 404
+```
+
 ## 数据模型
 
 ```text
@@ -604,6 +761,8 @@ reversals(reversal_id PK, stream_id, event_id, reversal_event_id,
           reversal_sequence, delta,
           UNIQUE(stream_id, event_id),
           FK(stream_id, event_id) -> events(stream_id, event_id))
+seals(stream_id PK, seal_id, next_sequence, event_count, sha256,
+      FK(stream_id) -> streams(stream_id))
 consumers(stream_id, consumer_id, cursor_seq,
           lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
           PK(stream_id, consumer_id))
@@ -624,6 +783,12 @@ consumers(stream_id, consumer_id, cursor_seq,
   的序号），租约四列要么整体为 NULL（无有效租约），要么整体非空。一行只持有一个
   租约，因此领取与确认都在 `BEGIN IMMEDIATE` 事务内串行执行——即使多个应用实例
   同时领取，数据库中也只会存在一个有效租约。
+- `seals` 以 `stream_id` 为主键记录每流至多一条的不可逆封存：`seal_id` 为流内
+  幂等键，`next_sequence` 为封存时的版本（连续前缀长度），`event_count`/`sha256`
+  为按 sequence 升序的规范 JSON 行（`ensure_ascii=False`、紧凑分隔符、UTF-8、
+  换行拼接、无末尾换行）摘要。另外 `BEFORE INSERT` 触发器
+  `trg_events_sealed_insert` 在存储层兜底：任何向已封存流插入 `events` 行的尝试
+  都会被数据库直接中止，与应用层的 `stream_sealed` 检查共同保证封存不可逆。
 
 租约生命周期：
 
@@ -708,6 +873,26 @@ consumers(stream_id, consumer_id, cursor_seq,
 的请求成功，其余读到撤销记录后得到 `409 event_already_reversed`——补偿事件
 恰好追加一次。
 
+封存的处理同样在单个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 锁定并读取流：不存在直接返回 `404 stream_not_found`（事务内不做任何写入）；
+2. 按 `stream_id` 查 `seals`：已存在则比对 `seal_id`/`expected_next_sequence`，
+   任一不一致返回 `409 seal_replay_conflict`，完全一致则回放原封存记录
+   （HTTP `200`，原 SHA-256 不变）；
+3. 首次请求：比对流当前 `next_sequence` 与 `expected_next_sequence`，不一致返回
+   `409 version_mismatch`（先于暂存检查）；
+4. 检查是否存在 `applied=0` 的暂存事件，存在则返回
+   `409 stream_has_pending_events`；
+5. 按 sequence 升序读取全部已应用事件，逐条生成规范 JSON 行
+   （`[sequence,event_id,delta]`，`ensure_ascii=False` 保留 Unicode、紧凑分隔符
+   无空白、UTF-8），以 `\n` 拼接（无末尾换行）后计算 SHA-256；
+6. 写入 `seals` 记录并统一提交——任一步失败整体回滚，不留封存记录。
+
+封存后，普通提交、转账、撤销的写事务在**追加任何事件之前**先查 `seals`：命中即
+返回 `409 stream_sealed`；幂等重放路径不写事件（命中既有 `event_id` /
+`transfers` / `reversals` 记录后直接返回原坐标），因此封存前完成的操作仍可安全
+重试。查询、claim/ack 与 fork 不追加源流事件，行为完全不变。
+
 ## 配置
 
 | 环境变量                | 默认值                | 说明                          |
@@ -740,7 +925,15 @@ token 的三种 409、租约到期后同批重新领取、多消费者独立游�
 `409`（且失败的 `reversal_id` 不作废）、流/事件缺失 `404`、未应用事件 `409` 且
 缺号补齐后可撤销、请求体 `422`、补偿事件关闭缺号一并追赶暂存事件、补偿事件可被
 claim/fork 观察、撤销转账事件、撤销的撤销，以及 20 线程并发（同一 `reversal_id`
-只补偿一次；不同 `reversal_id` 争抢同一事件时恰好一个成功）。
+只补偿一次；不同 `reversal_id` 争抢同一事件时恰好一个成功）；
+流封存部分覆盖：正常封存与规范 SHA-256（含 Unicode 事件名按字面量保留）、空流
+封存（空输入 SHA-256）、流不存在 `404`、版本不符 `409 version_mismatch` 且不消耗
+`seal_id`、存在暂存事件 `409 stream_has_pending_events` 且补齐后可封存、相同请求
+重试 `200` 返回同一摘要、`seal_id`/版本漂移 `409 seal_replay_conflict`、封存后
+新提交 `409 stream_sealed` 但旧事件幂等重放 `200`、封存流作为转账源/目标均被拒
+但封存前转账可重放、封存后新撤销被拒但封存前撤销可重放、封存流仍可查询/消费/
+ack/作为 fork 源且 fork 目标可追加、请求体 `422`，以及 20 线程并发（同一封存
+请求恰好一次 `201`，其余 `200`）。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
@@ -749,6 +942,7 @@ python3 verify_core.py
 python3 verify_forks.py
 python3 verify_transfers.py
 python3 verify_reversals.py
+python3 verify_seals.py
 ```
 
 ## 项目结构
@@ -762,6 +956,7 @@ python3 verify_reversals.py
 │   ├── forks.py       # 流分叉（fork）幂等事务
 │   ├── transfers.py   # 跨事件流原子转账（transfer）幂等事务
 │   ├── reversals.py   # 事件撤销（reversal）幂等事务
+│   ├── seals.py       # 不可逆封存（seal）与规范 SHA-256 摘要
 │   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
@@ -770,6 +965,7 @@ python3 verify_reversals.py
 ├── verify_forks.py
 ├── verify_transfers.py
 ├── verify_reversals.py
+├── verify_seals.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

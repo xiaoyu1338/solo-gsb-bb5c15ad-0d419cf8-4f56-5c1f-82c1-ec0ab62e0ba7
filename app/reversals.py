@@ -117,6 +117,15 @@ def create_reversal(
                 status_code=404,
             )
 
+        # Sealing is irreversible: a sealed stream rejects new compensation
+        # events. Reversals completed before the seal take the replay branch
+        # above and still return their original result.
+        if repo.is_sealed(conn, stream_id):
+            raise ReversalError(
+                "stream_sealed",
+                f"stream {stream_id!r} is sealed and cannot accept new events",
+            )
+
         event = conn.execute(
             "SELECT event_id, sequence, delta, applied "
             "FROM events WHERE stream_id = ? AND event_id = ?",
