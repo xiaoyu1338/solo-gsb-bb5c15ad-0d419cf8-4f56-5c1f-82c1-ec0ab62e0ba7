@@ -152,6 +152,20 @@ def create_transfer(
                 status_code=404,
             )
 
+        # Sealed streams are frozen: a completed transfer still replays via the
+        # idempotency branch above, but no new debit/credit events may be added.
+        sealed_side = conn.execute(
+            "SELECT stream_id FROM seals WHERE stream_id IN (?, ?)",
+            (source_stream_id, target_stream_id),
+        ).fetchone()
+        if sealed_side is not None:
+            raise TransferError(
+                "stream_sealed",
+                f"stream {sealed_side['stream_id']!r} is sealed and cannot "
+                "participate in a new transfer (replaying a completed "
+                "transfer still returns its original result)",
+            )
+
         # Balance reflects exactly the applied prefix [0, next_sequence); the
         # pending buffered events are not spendable until their gap closes.
         if source["balance"] < amount:

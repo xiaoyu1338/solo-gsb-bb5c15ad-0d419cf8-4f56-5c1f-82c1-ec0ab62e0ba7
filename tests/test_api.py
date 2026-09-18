@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
 
@@ -1171,3 +1173,298 @@ def test_concurrent_distinct_reversals_same_event_compensate_once(client):
     assert len(codes) == 19 and set(codes) == {"event_already_reversed"}
     state = client.get("/streams/r-race2").json()
     assert state["balance"] == 0 and state["next_sequence"] == 2
+
+# --------------------------------------------------------------------------- #
+# Irreversible stream sealing
+# --------------------------------------------------------------------------- #
+
+
+def _seal(client, stream_id, seal_id, expected_next_sequence):
+    return client.post(
+        f"/streams/{stream_id}/seal",
+        json={
+            "seal_id": seal_id,
+            "expected_next_sequence": expected_next_sequence,
+        },
+    )
+
+
+def _canonical_digest(triples):
+    payload = "\n".join(
+        json.dumps(t, separators=(",", ":"), ensure_ascii=False) for t in triples
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_seal_creates_record_with_canonical_digest(client):
+    _post(client, "z-basic", "e0", 0, 100)
+    _post(client, "z-basic", "e1", 1, -30)
+    _post(client, "z-basic", "事件-2", 2, 20)  # Unicode event id kept verbatim
+
+    r = _seal(client, "z-basic", "seal-basic", 3)
+    assert r.status_code == 201
+    body = r.json()
+    assert body == {
+        "status": "ok",
+        "replayed": False,
+        "stream_id": "z-basic",
+        "seal_id": "seal-basic",
+        "next_sequence": 3,
+        "event_count": 3,
+        "sha256": _canonical_digest([(0, "e0", 100), (1, "e1", -30), (2, "事件-2", 20)]),
+        "sealed_at": body["sealed_at"],
+    }
+    assert isinstance(body["sealed_at"], int) and body["sealed_at"] > 0
+    # Hex SHA-256 digest: 64 lowercase hex chars.
+    assert len(body["sha256"]) == 64
+    assert body["sha256"] == body["sha256"].lower()
+
+
+def test_seal_replay_same_request_returns_original_result(client):
+    _seed_deltas(client, "z-rep", (10, 20))
+    first = _seal(client, "z-rep", "seal-rep", 2)
+    assert first.status_code == 201
+    first_body = first.json()
+
+    second = _seal(client, "z-rep", "seal-rep", 2)
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["replayed"] is True
+    # The stored seal result is returned verbatim (only the replay flag differs).
+    assert {**second_body, "replayed": False} == first_body
+
+    # Even a stale version token replays once the seal id already exists.
+    third = _seal(client, "z-rep", "seal-rep", 999)
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["replayed"] is True
+    assert {**third_body, "replayed": False} == first_body
+
+
+def test_seal_same_id_different_stream_returns_409(client):
+    _seed_deltas(client, "z-drift-a", (1,))
+    _seed_deltas(client, "z-drift-b", (1,))
+    assert _seal(client, "z-drift-a", "seal-drift", 1).status_code == 201
+
+    r = _seal(client, "z-drift-b", "seal-drift", 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "seal_replay_conflict"
+    # The second stream was not sealed by the clashing request.
+    assert _seal(client, "z-drift-b", "seal-drift-b", 1).status_code == 201
+
+
+def test_seal_twice_with_distinct_ids_returns_409(client):
+    _seed_deltas(client, "z-twice", (1, 2))
+    assert _seal(client, "z-twice", "seal-a", 2).status_code == 201
+
+    r = _seal(client, "z-twice", "seal-b", 2)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_already_sealed"
+
+
+def test_seal_on_unknown_stream_returns_404_and_creates_nothing(client):
+    r = _seal(client, "z-ghost", "seal-404", 0)
+    assert r.status_code == 404
+    assert r.json()["detail"]["code"] == "stream_not_found"
+    assert client.get("/streams/z-ghost").status_code == 404
+
+
+def test_seal_with_pending_events_returns_409(client):
+    _post(client, "z-pend", "p1", 1, 5)  # buffered behind a gap at 0
+    r = _seal(client, "z-pend", "seal-pend", 0)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_has_pending_events"
+    # No seal row: the same seal_id succeeds once the gap closes.
+    _post(client, "z-pend", "p0", 0, 10)
+    r = _seal(client, "z-pend", "seal-pend", 2)
+    assert r.status_code == 201
+    assert r.json()["event_count"] == 2
+    assert r.json()["sha256"] == _canonical_digest([(0, "p0", 10), (1, "p1", 5)])
+
+
+def test_seal_version_mismatch_returns_409(client):
+    _seed_deltas(client, "z-ver", (1, 2, 3))  # next_sequence = 3
+    r = _seal(client, "z-ver", "seal-low", 2)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "sequence_mismatch"
+    r = _seal(client, "z-ver", "seal-high", 4)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "sequence_mismatch"
+    # Failed attempts neither sealed the stream nor burned their seal ids.
+    assert _seal(client, "z-ver", "seal-low", 3).status_code == 201
+
+
+def test_seal_validation_rejects_bad_payloads(client):
+    _seed_deltas(client, "z-val", (1,))
+    url = "/streams/z-val/seal"
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"seal_id": "", "expected_next_sequence": 1}).status_code == 422
+    assert client.post(url, json={"seal_id": "   ", "expected_next_sequence": 1}).status_code == 422
+    assert client.post(url, json={"seal_id": 1, "expected_next_sequence": 1}).status_code == 422
+    assert client.post(url, json={"seal_id": "s", "expected_next_sequence": -1}).status_code == 422
+    assert client.post(url, json={"seal_id": "s", "expected_next_sequence": True}).status_code == 422
+    assert client.post(url, json={"seal_id": "s", "expected_next_sequence": "x"}).status_code == 422
+    assert client.post(url, json={"seal_id": "s"}).status_code == 422
+    # Validation failure never sealed the stream.
+    assert _seal(client, "z-val", "seal-val", 1).status_code == 201
+
+
+def test_sealed_stream_rejects_new_events_but_replays_existing(client):
+    _seed_deltas(client, "z-freeze", (100, -30, 20))
+    assert _seal(client, "z-freeze", "seal-freeze", 3).status_code == 201
+
+    # New event: 409 stream_sealed.
+    r = _post(client, "z-freeze", "e3", 3, 5)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    # An unknown event id at a free sequence is also rejected after sealing.
+    r = _post(client, "z-freeze", "e99", 99, 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    # Idempotent replay of a pre-seal event still returns 200 with the frozen state.
+    r = _post(client, "z-freeze", "z-freeze-e0", 0, 100)
+    assert r.status_code == 200
+    assert r.json()["replayed"] is True
+    assert r.json()["stream"] == {
+        "stream_id": "z-freeze",
+        "balance": 90,
+        "next_sequence": 3,
+        "pending_sequences": [],
+    }
+    # Replay content conflict still reports the original replay_conflict.
+    r = _post(client, "z-freeze", "z-freeze-e0", 0, 999)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "replay_conflict"
+
+
+def test_sealed_stream_rejects_new_transfers_but_replays_completed(client):
+    _seed_balance(client, "z-t-a", 100)
+    _seed_balance(client, "z-t-b", 0)
+    first = _transfer(client, "z-txn", "z-t-a", "z-t-b", 40)
+    assert first.status_code == 201
+    assert _seal(client, "z-t-a", "seal-t-a", 2).status_code == 201
+
+    # A new transfer touching the sealed stream is blocked on both sides.
+    r = _transfer(client, "z-txn-new", "z-t-a", "z-t-b", 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    _seed_balance(client, "z-t-c", 100)
+    r = _transfer(client, "z-txn-new2", "z-t-c", "z-t-a", 1)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    # The sealed stream's balance is untouched.
+    assert client.get("/streams/z-t-a").json()["balance"] == 60
+
+    # The transfer that completed before sealing still replays with its
+    # original event coordinates.
+    r = _transfer(client, "z-txn", "z-t-a", "z-t-b", 40)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["replayed"] is True
+    assert body["source"]["sequence"] == 1
+    assert body["target"]["sequence"] == 1
+
+
+def test_sealed_stream_rejects_new_reversal_but_replays_completed(client):
+    _seed_deltas(client, "z-r", (40,))
+    first = _reverse(client, "z-r", "z-r-e0", "z-rev")
+    assert first.status_code == 201
+    assert _seal(client, "z-r", "seal-z-r", 2).status_code == 201
+
+    # New reversal (of the pre-seal compensation event) is blocked.
+    r = _reverse(client, "z-r", "reversal:z-rev", "z-rev-2")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "stream_sealed"
+    # The completed reversal still replays with its original coordinates.
+    r = _reverse(client, "z-r", "z-r-e0", "z-rev")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["replayed"] is True
+    assert body["sequence"] == 1
+    assert body["reversal_event_id"] == "reversal:z-rev"
+
+
+def test_sealed_stream_still_queryable_consumable_and_forkable(client):
+    _seed_deltas(client, "z-q", (100, 20))
+    seal = _seal(client, "z-q", "seal-z-q", 2)
+    assert seal.status_code == 201
+
+    # Querying works.
+    state = client.get("/streams/z-q").json()
+    assert state == {
+        "stream_id": "z-q",
+        "balance": 120,
+        "next_sequence": 2,
+        "pending_sequences": [],
+    }
+
+    # Consuming works end to end.
+    batch = _claim(client, "z-q", "worker", 10).json()
+    assert [(e["event_id"], e["sequence"], e["delta"]) for e in batch["events"]] == [
+        ("z-q-e0", 0, 100),
+        ("z-q-e1", 1, 20),
+    ]
+    assert _ack(client, "z-q", "worker", batch["lease_token"]).status_code == 200
+
+    # The sealed stream remains a valid fork source ...
+    r = _fork(client, "z-q", "fork-z-q", "z-q-clone", 2)
+    assert r.status_code == 201
+    assert r.json()["balance"] == 120 and r.json()["next_sequence"] == 2
+    # ... and forking copies the log but does not seal the target.
+    r = _post(client, "z-q-clone", "z-q-clone-e2", 2, 3)
+    assert r.status_code == 201
+    assert r.json()["stream"]["balance"] == 123
+
+
+def test_seal_empty_existing_stream_hashes_empty_string(client):
+    # A fork with through_sequence 0 creates a stream that exists but has no events.
+    _seed_deltas(client, "z-empty-src", (1,))
+    assert _fork(client, "z-empty-src", "fork-empty", "z-empty", 0).status_code == 201
+    r = _seal(client, "z-empty", "seal-empty", 0)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["event_count"] == 0
+    assert body["sha256"] == hashlib.sha256(b"").hexdigest()
+
+
+def test_concurrent_seal_requests_commit_exactly_once(client):
+    import threading
+
+    _seed_deltas(client, "z-conc", tuple(1 for _ in range(10)))
+    statuses: list[int] = []
+    digests: list[str] = []
+
+    def do_seal():
+        r = _seal(client, "z-conc", "seal-conc", 10)
+        statuses.append(r.status_code)
+        digests.append(r.json()["sha256"])
+
+    threads = [threading.Thread(target=do_seal) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(statuses) == [200] * 19 + [201]
+    assert len(set(digests)) == 1
+
+
+def test_concurrent_distinct_seal_ids_one_wins(client):
+    import threading
+
+    _seed_deltas(client, "z-conc2", (1,))
+    codes: list[str] = []
+
+    def do_seal(i):
+        r = _seal(client, "z-conc2", f"seal-many-{i}", 1)
+        if r.status_code != 201:
+            codes.append(r.json()["detail"]["code"])
+
+    threads = [threading.Thread(target=do_seal, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(codes) == 19
+    assert set(codes) == {"stream_already_sealed"}

@@ -155,6 +155,17 @@ def submit_event(
                 )
             replayed = True
         else:
+            # A sealed stream is frozen: replays of events already stored stay
+            # idempotent, but no new event may ever be appended to it.
+            sealed = conn.execute(
+                "SELECT 1 FROM seals WHERE stream_id = ?", (stream_id,)
+            ).fetchone()
+            if sealed is not None:
+                raise ConflictError(
+                    "stream_sealed",
+                    f"stream {stream_id!r} is sealed; no new events can be "
+                    "submitted (idempotent replays of existing events still work)",
+                )
             clash = _get_event_by_sequence(conn, stream_id, sequence)
             if clash is not None:
                 # The UNIQUE(stream_id, sequence) index also guards this, but

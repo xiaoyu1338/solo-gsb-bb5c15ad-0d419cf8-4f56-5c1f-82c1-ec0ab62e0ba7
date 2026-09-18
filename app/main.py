@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import consumers, db, forks, repo, reversals, transfers
+from . import consumers, db, forks, repo, reversals, seals, transfers
 
 
 @asynccontextmanager
@@ -219,6 +219,45 @@ class ReversalOut(BaseModel):
     stream: StreamStateOut = Field(..., description="Latest state of the stream after the reversal")
 
 
+class SealIn(BaseModel):
+    seal_id: str = Field(..., min_length=1, description="Client-assigned global idempotency key")
+    expected_next_sequence: int = Field(
+        ..., ge=0, description="Stream version; must equal the stream's current next_sequence"
+    )
+
+    @field_validator("seal_id")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("expected_next_sequence", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # In lax mode pydantic accepts bool as int; JSON booleans are not integers here.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return value
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"seal_id": "seal-1", "expected_next_sequence": 3}]
+        }
+    }
+
+
+class SealOut(BaseModel):
+    status: str
+    replayed: bool
+    stream_id: str
+    seal_id: str
+    next_sequence: int = Field(..., description="Sealed version: final applied sequence count")
+    event_count: int = Field(..., description="Number of applied events covered by the digest")
+    sha256: str = Field(..., description="SHA-256 of the canonical newline-joined JSON event lines")
+    sealed_at: int = Field(..., description="POSIX milliseconds when the seal was created")
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -404,6 +443,50 @@ def reverse_event(stream_id: str, event_id: str, body: ReversalIn):
         )
     # Idempotent replays return 200; first-time reversals return 201.
     return JSONResponse(_reversal_payload(result), status_code=200 if result.replayed else 201)
+
+
+def _seal_payload(seal: seals.Seal) -> dict:
+    return SealOut(
+        status="ok",
+        replayed=seal.replayed,
+        stream_id=seal.stream_id,
+        seal_id=seal.seal_id,
+        next_sequence=seal.next_sequence,
+        event_count=seal.event_count,
+        sha256=seal.sha256,
+        sealed_at=seal.sealed_at,
+    ).model_dump()
+
+
+@app.post(
+    "/streams/{stream_id}/seal",
+    response_model=SealOut,
+    status_code=201,
+    responses={200: {"model": SealOut, "description": "Idempotent replay of an existing seal"}},
+    tags=["seals"],
+    summary="Irreversibly seal the stream's applied event log with a SHA-256 digest",
+)
+def seal_stream(stream_id: str, body: SealIn):
+    try:
+        seal = seals.create_seal(stream_id, body.seal_id, body.expected_next_sequence)
+    except seals.SealError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: the seals PRIMARY KEY / UNIQUE constraints map to 409.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+    if seal is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    # Idempotent replays return 200; first-time seals return 201.
+    return JSONResponse(_seal_payload(seal), status_code=200 if seal.replayed else 201)
 
 
 @app.post(

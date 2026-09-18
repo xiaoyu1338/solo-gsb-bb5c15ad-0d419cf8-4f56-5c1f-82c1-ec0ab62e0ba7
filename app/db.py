@@ -116,6 +116,22 @@ def initialise() -> None:
                     REFERENCES events(stream_id, event_id)
             );
 
+            -- One row per irreversibly sealed stream. A seal freezes the
+            -- applied event log forever: its SHA-256 digest is computed over
+            -- the canonical JSON lines of every applied event in sequence
+            -- order, and the stream PK guarantees a stream is sealed at most
+            -- once. seal_id is globally unique so retried seal requests can
+            -- be recognised and replayed like the other idempotent ledgers.
+            CREATE TABLE IF NOT EXISTS seals (
+                stream_id  TEXT PRIMARY KEY,
+                seal_id    TEXT NOT NULL UNIQUE,
+                sequence   INTEGER NOT NULL CHECK (sequence >= 0),
+                event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                sha256     TEXT NOT NULL,
+                sealed_at  INTEGER NOT NULL CHECK (sealed_at >= 0),
+                FOREIGN KEY (stream_id) REFERENCES streams(stream_id)
+            );
+
             -- One row per (stream, consumer): the consumption cursor plus the
             -- at-most-one outstanding claim lease. Lease columns are either all
             -- NULL (no lease) or all set together.

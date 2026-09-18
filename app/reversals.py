@@ -117,6 +117,19 @@ def create_reversal(
                 status_code=404,
             )
 
+        # A sealed stream is frozen: a completed reversal still replays via
+        # the idempotency branch above, but no new compensation event may be
+        # appended to it.
+        sealed = conn.execute(
+            "SELECT 1 FROM seals WHERE stream_id = ?", (stream_id,)
+        ).fetchone()
+        if sealed is not None:
+            raise ReversalError(
+                "stream_sealed",
+                f"stream {stream_id!r} is sealed; no new reversals can be "
+                "appended (idempotent replays of existing reversals still work)",
+            )
+
         event = conn.execute(
             "SELECT event_id, sequence, delta, applied "
             "FROM events WHERE stream_id = ? AND event_id = ?",
